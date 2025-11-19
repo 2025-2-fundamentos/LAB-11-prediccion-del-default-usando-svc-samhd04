@@ -95,3 +95,193 @@
 # {'type': 'cm_matrix', 'dataset': 'train', 'true_0': {"predicted_0": 15562, "predicte_1": 666}, 'true_1': {"predicted_0": 3333, "predicted_1": 1444}}
 # {'type': 'cm_matrix', 'dataset': 'test', 'true_0': {"predicted_0": 15562, "predicte_1": 650}, 'true_1': {"predicted_0": 2490, "predicted_1": 1420}}
 #
+
+import os
+import gzip
+import json
+import pickle
+import zipfile
+from pathlib import Path
+
+import pandas as pd
+
+from sklearn.pipeline import Pipeline
+from sklearn.compose import ColumnTransformer
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
+from sklearn.decomposition import PCA
+from sklearn.feature_selection import SelectKBest, f_classif
+from sklearn.svm import SVC
+from sklearn.model_selection import GridSearchCV
+from sklearn.metrics import (
+    balanced_accuracy_score,
+    precision_score,
+    recall_score,
+    f1_score,
+    confusion_matrix,
+)
+
+# Paso 1 — Lectura del CSV dentro del ZIP y limpieza
+
+# Rutas de entrada
+train_zip = "files/input/train_data.csv.zip"
+test_zip = "files/input/test_data.csv.zip"
+
+interno_train = "train_default_of_credit_card_clients.csv"
+interno_test = "test_default_of_credit_card_clients.csv"
+
+# leer CSVs internos
+with zipfile.ZipFile(train_zip, "r") as zf:
+    with zf.open(interno_train) as f:
+        train_pd = pd.read_csv(f)
+
+with zipfile.ZipFile(test_zip, "r") as zf:
+    with zf.open(interno_test) as f:
+        test_pd = pd.read_csv(f)
+
+# limpieza básica
+train_pd = train_pd.drop("ID", axis=1)
+test_pd = test_pd.drop("ID", axis=1)
+
+train_pd = train_pd.rename(columns={"default payment next month": "default"})
+test_pd = test_pd.rename(columns={"default payment next month": "default"})
+
+train_pd = train_pd.dropna()
+test_pd = test_pd.dropna()
+
+# filtrar EDUCATION y MARRIAGE ≠ 0
+train_pd = train_pd[(train_pd["EDUCATION"] != 0) & (train_pd["MARRIAGE"] != 0)]
+test_pd = test_pd[(test_pd["EDUCATION"] != 0) & (test_pd["MARRIAGE"] != 0)]
+
+# agrupar EDUCATION > 4 → 4
+train_pd.loc[train_pd["EDUCATION"] > 4, "EDUCATION"] = 4
+test_pd.loc[test_pd["EDUCATION"] > 4, "EDUCATION"] = 4
+
+# Paso 2 — Separar variables
+
+X_train = train_pd.drop(columns=["default"])
+y_train = train_pd["default"]
+
+X_test = test_pd.drop(columns=["default"])
+y_test = test_pd["default"]
+
+# Paso 3 — Pipeline (OneHot + PCA + StandardScaler + KBest + SVM)
+
+cat_cols = ["SEX", "EDUCATION", "MARRIAGE"]
+num_cols = [
+    "LIMIT_BAL",
+    "AGE",
+    "PAY_0",
+    "PAY_2",
+    "PAY_3",
+    "PAY_4",
+    "PAY_5",
+    "PAY_6",
+    "BILL_AMT1",
+    "BILL_AMT2",
+    "BILL_AMT3",
+    "BILL_AMT4",
+    "BILL_AMT5",
+    "BILL_AMT6",
+    "PAY_AMT1",
+    "PAY_AMT2",
+    "PAY_AMT3",
+    "PAY_AMT4",
+    "PAY_AMT5",
+    "PAY_AMT6",
+]
+
+preprocessor = ColumnTransformer(
+    transformers=[
+        ("cat", OneHotEncoder(handle_unknown="ignore"), cat_cols),
+        ("std", StandardScaler(), num_cols),
+    ],
+    remainder="passthrough",
+)
+
+pipe = Pipeline(
+    steps=[
+        ("prep", preprocessor),
+        ("pca", PCA()),
+        ("kbest", SelectKBest(score_func=f_classif)),
+        ("svc", SVC(kernel="rbf", random_state=42)),
+    ]
+)
+
+# Paso 4 — GridSearchCV (hiperparámetros)
+
+param_grid = {
+    "pca__n_components": [20, 21],
+    "kbest__k": [12],
+    "svc__kernel": ["rbf"],
+    "svc__gamma": [0.099],
+}
+
+grid = GridSearchCV(
+    estimator=pipe,
+    param_grid=param_grid,
+    cv=10,
+    scoring="balanced_accuracy",
+    refit=True,
+    verbose=1,
+)
+
+# entrenar
+grid.fit(X_train, y_train)
+
+# Paso 5 — Guardar modelo comprimido
+
+Path("files/models").mkdir(parents=True, exist_ok=True)
+
+with gzip.open("files/models/model.pkl.gz", "wb") as f:
+    pickle.dump(grid, f)
+
+# Paso 6 — Métricas (train y test)
+
+y_pred_train = grid.predict(X_train)
+y_pred_test = grid.predict(X_test)
+
+train_metrics = {
+    "type": "metrics",
+    "dataset": "train",
+    "precision": precision_score(y_train, y_pred_train),
+    "balanced_accuracy": balanced_accuracy_score(y_train, y_pred_train),
+    "recall": recall_score(y_train, y_pred_train),
+    "f1_score": f1_score(y_train, y_pred_train),
+}
+
+test_metrics = {
+    "type": "metrics",
+    "dataset": "test",
+    "precision": precision_score(y_test, y_pred_test),
+    "balanced_accuracy": balanced_accuracy_score(y_test, y_pred_test),
+    "recall": recall_score(y_test, y_pred_test),
+    "f1_score": f1_score(y_test, y_pred_test),
+}
+
+# Paso 7 — Matrices de confusión
+
+tn, fp, fn, tp = confusion_matrix(y_train, y_pred_train).ravel()
+cm_train = {
+    "type": "cm_matrix",
+    "dataset": "train",
+    "true_0": {"predicted_0": int(tn), "predicted_1": int(fp)},
+    "true_1": {"predicted_0": int(fn), "predicted_1": int(tp)},
+}
+
+tn, fp, fn, tp = confusion_matrix(y_test, y_pred_test).ravel()
+cm_test = {
+    "type": "cm_matrix",
+    "dataset": "test",
+    "true_0": {"predicted_0": int(tn), "predicted_1": int(fp)},
+    "true_1": {"predicted_0": int(fn), "predicted_1": int(tp)},
+}
+
+# Guardar en metrics.json
+
+Path("files/output").mkdir(parents=True, exist_ok=True)
+
+with open("files/output/metrics.json", "w", encoding="utf-8") as f:
+    f.write(json.dumps(train_metrics) + "\n")
+    f.write(json.dumps(test_metrics) + "\n")
+    f.write(json.dumps(cm_train) + "\n")
+    f.write(json.dumps(cm_test) + "\n")
